@@ -212,7 +212,8 @@
       }
 
       resultCard.hidden = false;
-      status.textContent = `Done. ${segments.length} segment(s), language: ${data.language || "unknown"}.`;
+      const lang = data.transcription_info?.language || data.language || "unknown";
+      status.textContent = `Done. ${segments.length} segment(s), language: ${lang}.`;
     }
   </script>
 </body>
