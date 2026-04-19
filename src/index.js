@@ -27,7 +27,7 @@ export default {
         }
 
         const result = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
-          audio: [...audio],
+          audio: audio,          // Uint8Array directly
           task: "transcribe",
           vad_filter: true,
         });
