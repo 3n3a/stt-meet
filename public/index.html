@@ -1,12 +1,219 @@
 <!doctype html>
 <html lang="en">
-	<head>
-		<meta charset="UTF-8" />
-		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<title>Hello, World!</title>
-	</head>
-	<body>
-		<h1 id="heading">Hello, World!</h1>
-		<p>This page comes from a static asset stored at `public/index.html` as configured in `wrangler.jsonc`.</p>
-	</body>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Speech to Text</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+</head>
+<body>
+  <main class="container">
+    <hgroup>
+      <h1>Speech to Text</h1>
+      <p>Record from your microphone or upload an audio file. Transcription is color-coded by speaker.</p>
+    </hgroup>
+
+    <article>
+      <h2>Record</h2>
+      <div role="group">
+        <button id="recordBtn" type="button">Start recording</button>
+        <button id="stopBtn" type="button" disabled class="secondary">Stop</button>
+      </div>
+      <p><small id="recStatus">Idle.</small></p>
+      <audio id="recPlayback" controls hidden></audio>
+    </article>
+
+    <article>
+      <h2>Or upload a file</h2>
+      <input type="file" id="fileInput" accept="audio/*,video/*" />
+    </article>
+
+    <article>
+      <h2>Transcribe</h2>
+      <button id="transcribeBtn" type="button" disabled>Transcribe</button>
+      <progress id="progress" hidden></progress>
+      <p><small id="status"></small></p>
+    </article>
+
+    <article id="resultCard" hidden>
+      <h2>Transcription</h2>
+      <div id="legend" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem"></div>
+      <div id="transcript" style="line-height:1.8"></div>
+    </article>
+  </main>
+
+  <script>
+    // ---- Config ------------------------------------------------------------
+    // Set this to your deployed Worker URL, e.g. "https://stt.you.workers.dev"
+    const WORKER_URL = "/transcribe";
+
+    // Pause (in seconds) between Whisper segments that we treat as a speaker change.
+    // Pure heuristic — Whisper itself does not identify speakers.
+    const SPEAKER_SWITCH_GAP = 1.2;
+
+    // Colors cycle through speakers. Uses Pico CSS variables so it respects the theme.
+    const SPEAKER_COLORS = [
+      "var(--pico-color-azure-550)",
+      "var(--pico-color-pumpkin-550)",
+      "var(--pico-color-jade-550)",
+      "var(--pico-color-purple-550)",
+      "var(--pico-color-red-550)",
+      "var(--pico-color-lime-600)",
+    ];
+
+    // ---- State -------------------------------------------------------------
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let audioBlob = null; // whatever source we will transcribe
+
+    // ---- DOM ---------------------------------------------------------------
+    const recordBtn = document.getElementById("recordBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const recStatus = document.getElementById("recStatus");
+    const recPlayback = document.getElementById("recPlayback");
+    const fileInput = document.getElementById("fileInput");
+    const transcribeBtn = document.getElementById("transcribeBtn");
+    const progress = document.getElementById("progress");
+    const status = document.getElementById("status");
+    const resultCard = document.getElementById("resultCard");
+    const transcript = document.getElementById("transcript");
+    const legend = document.getElementById("legend");
+
+    // ---- Recording ---------------------------------------------------------
+    recordBtn.addEventListener("click", async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recordedChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordedChunks.push(e.data);
+        };
+        mediaRecorder.onstop = () => {
+          const mime = mediaRecorder.mimeType || "audio/webm";
+          audioBlob = new Blob(recordedChunks, { type: mime });
+          recPlayback.src = URL.createObjectURL(audioBlob);
+          recPlayback.hidden = false;
+          stream.getTracks().forEach((t) => t.stop());
+          recStatus.textContent = `Recorded ${(audioBlob.size / 1024).toFixed(1)} KB.`;
+          transcribeBtn.disabled = false;
+        };
+        mediaRecorder.start();
+        recordBtn.disabled = true;
+        stopBtn.disabled = false;
+        recStatus.textContent = "Recording…";
+      } catch (err) {
+        recStatus.textContent = `Microphone error: ${err.message}`;
+      }
+    });
+
+    stopBtn.addEventListener("click", () => {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      recordBtn.disabled = false;
+      stopBtn.disabled = true;
+    });
+
+    // ---- File upload -------------------------------------------------------
+    fileInput.addEventListener("change", () => {
+      const f = fileInput.files?.[0];
+      if (f) {
+        audioBlob = f;
+        transcribeBtn.disabled = false;
+        recStatus.textContent = `File selected: ${f.name} (${(f.size / 1024).toFixed(1)} KB).`;
+      }
+    });
+
+    // ---- Transcribe --------------------------------------------------------
+    transcribeBtn.addEventListener("click", async () => {
+      if (!audioBlob) return;
+      transcribeBtn.disabled = true;
+      progress.hidden = false;
+      status.textContent = "Uploading and transcribing…";
+      resultCard.hidden = true;
+      transcript.innerHTML = "";
+      legend.innerHTML = "";
+
+      try {
+        const buf = await audioBlob.arrayBuffer();
+        const res = await fetch(WORKER_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: buf,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+        const data = await res.json();
+        renderTranscript(data);
+      } catch (err) {
+        status.textContent = `Error: ${err.message}`;
+      } finally {
+        progress.hidden = true;
+        transcribeBtn.disabled = false;
+      }
+    });
+
+    // ---- Rendering ---------------------------------------------------------
+    function assignSpeakers(segments) {
+      // Heuristic: a gap between segments longer than SPEAKER_SWITCH_GAP seconds
+      // flips to the next speaker. Two-speaker alternation by default; if the gap
+      // is very large (> 3s) we also treat it as a switch.
+      if (!segments || segments.length === 0) return [];
+      let speaker = 0;
+      let lastEnd = segments[0].start ?? 0;
+      return segments.map((seg, i) => {
+        if (i > 0) {
+          const gap = (seg.start ?? 0) - lastEnd;
+          if (gap > SPEAKER_SWITCH_GAP) {
+            speaker = (speaker + 1) % 2; // alternate between 2 speakers
+          }
+        }
+        lastEnd = seg.end ?? seg.start ?? lastEnd;
+        return { ...seg, speaker };
+      });
+    }
+
+    function renderTranscript(data) {
+      const segments = data.segments || [];
+      if (segments.length === 0 && data.text) {
+        // Fallback: no segments, just raw text
+        transcript.textContent = data.text;
+        resultCard.hidden = false;
+        status.textContent = "Done (no segment data — speaker coloring unavailable).";
+        return;
+      }
+
+      const tagged = assignSpeakers(segments);
+      const speakersUsed = new Set(tagged.map((s) => s.speaker));
+
+      // Legend
+      for (const sp of [...speakersUsed].sort()) {
+        const chip = document.createElement("span");
+        chip.textContent = `Speaker ${sp + 1}`;
+        chip.style.color = SPEAKER_COLORS[sp % SPEAKER_COLORS.length];
+        chip.style.fontWeight = "600";
+        chip.style.padding = "0.1rem 0.5rem";
+        chip.style.border = `1px solid ${SPEAKER_COLORS[sp % SPEAKER_COLORS.length]}`;
+        chip.style.borderRadius = "0.25rem";
+        legend.appendChild(chip);
+      }
+
+      // Paragraph-ish rendering: start a new <p> when speaker changes
+      let currentSpeaker = -1;
+      let currentP = null;
+      for (const seg of tagged) {
+        if (seg.speaker !== currentSpeaker) {
+          currentP = document.createElement("p");
+          currentP.style.color = SPEAKER_COLORS[seg.speaker % SPEAKER_COLORS.length];
+          currentP.innerHTML = `<strong>Speaker ${seg.speaker + 1}:</strong> `;
+          transcript.appendChild(currentP);
+          currentSpeaker = seg.speaker;
+        }
+        currentP.append(seg.text + " ");
+      }
+
+      resultCard.hidden = false;
+      status.textContent = `Done. ${segments.length} segment(s), language: ${data.language || "unknown"}.`;
+    }
+  </script>
+</body>
 </html>
